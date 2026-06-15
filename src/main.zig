@@ -406,6 +406,13 @@ pub fn main() !void {
             try client_socket_fds.append(alloc, client_sock);
         }
         _ = try tail(client_socket_fds, false, false);
+    } else if (std.mem.eql(u8, cmd, "restore")) {
+        if (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+                return help();
+            }
+        }
+        return restoreSessions(&cfg, alloc);
     } else if (std.mem.eql(u8, cmd, "write") or std.mem.eql(u8, cmd, "wr")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -604,6 +611,9 @@ const Daemon = struct {
     // Set when the VT has received output since the last snapshot. Cleared
     // each time we dump a snapshot to disk. Idle sessions don't write.
     snapshot_dirty: bool = false,
+    // Set only by the `restore` command. daemonLoop reads the snapshot from
+    // disk and replays it into the freshly-init'd VT before serving clients.
+    restore_from_snapshot: bool = false,
 
     const EnsureSessionResult = struct {
         created: bool,
@@ -679,6 +689,19 @@ const Daemon = struct {
             0,
         );
         _ = cross.c.putenv(session_env.ptr);
+
+        // Chdir to the recorded cwd so restored sessions land in the directory
+        // they originated in, not in wherever `zmx restore` was invoked from.
+        // For a normal session create this is the user's current cwd, so it's
+        // a no-op. Best-effort: a missing directory just means the shell
+        // starts in the inheriting cwd with a warning.
+        if (self.cwd.len > 0) {
+            const cwd_z = try alloc.dupeZ(u8, self.cwd);
+            defer alloc.free(cwd_z);
+            std.posix.chdirZ(cwd_z) catch |err| {
+                std.log.warn("chdir to {s} failed err={s}", .{ self.cwd, @errorName(err) });
+            };
+        }
 
         if (self.command) |cmd_args| {
             const argv = try alloc.allocSentinel(?[*:0]const u8, cmd_args.len, null);
@@ -1290,6 +1313,7 @@ fn help() !void {
         \\  [d]etach                                 Detach all clients (ctrl+\\ for current client)
         \\  [l]ist|ls [--short]                      List active sessions
         \\  [k]ill <name>... [--force]               Kill session and all attached clients
+        \\  restore                                  Re-spawn sessions recorded under SOCKET_DIR/manifest
         \\  [hi]story <name> [--vt|--html]           Output session scrollback
         \\  [w]ait <name>...                         Wait for session tasks to complete
         \\  [t]ail <name>...                         Follow session output
@@ -1775,6 +1799,84 @@ fn detachAll(cfg: *Cfg) !void {
         error.BrokenPipe, error.ConnectionResetByPeer => return,
         else => return err,
     };
+}
+
+/// Restore every session recorded in {socket_dir}/manifest/. Sessions that
+/// are already live (a daemon answers on their socket) are skipped. Entries
+/// with a missing cwd are still spawned -- the chdir is best-effort and
+/// daemonLoop will start the shell in the parent's cwd with a warning.
+fn restoreSessions(cfg: *Cfg, alloc: std.mem.Allocator) !void {
+    var list_result = try persistence.readAll(alloc, cfg.socket_dir);
+    defer list_result.deinit();
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&stdout_buf);
+
+    if (list_result.items.len == 0) {
+        try stdout.interface.print("no sessions to restore\n", .{});
+        try stdout.interface.flush();
+        return;
+    }
+
+    var restored: usize = 0;
+    var skipped: usize = 0;
+    var failed: usize = 0;
+
+    for (list_result.items) |m| {
+        const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, m.name) catch |err| {
+            std.log.warn("getSocketPath failed session={s} err={s}", .{ m.name, @errorName(err) });
+            failed += 1;
+            continue;
+        };
+        defer alloc.free(socket_path);
+
+        // Skip if a daemon is already serving this session
+        if (ipc.connectSession(socket_path)) |fd| {
+            posix.close(fd);
+            try stdout.interface.print("skip {s} (already running)\n", .{m.name});
+            try stdout.interface.flush();
+            skipped += 1;
+            continue;
+        } else |_| {}
+
+        const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
+        var daemon = Daemon{
+            .running = true,
+            .cfg = cfg,
+            .alloc = alloc,
+            .clients = clients,
+            .session_name = m.name,
+            .socket_path = socket_path,
+            .pid = undefined,
+            .command = m.command,
+            .cwd = m.cwd,
+            .created_at = m.created_at_ns,
+            .leader_client_fd = null,
+            .restore_from_snapshot = true,
+        };
+
+        const result = daemon.ensureSession() catch |err| {
+            std.log.warn("ensureSession failed session={s} err={s}", .{ m.name, @errorName(err) });
+            failed += 1;
+            continue;
+        };
+
+        // If we're the forked daemon child, daemonLoop already returned. Exit
+        // the restore loop so the child process unwinds cleanly. The parent
+        // (the user's `zmx restore` invocation) continues with the next entry.
+        if (result.is_daemon) return;
+        if (result.created) {
+            try stdout.interface.print("restored {s} (cwd={s})\n", .{ m.name, m.cwd });
+            try stdout.interface.flush();
+            restored += 1;
+        }
+    }
+
+    try stdout.interface.print(
+        "\nrestored={d} skipped={d} failed={d}\n",
+        .{ restored, skipped, failed },
+    );
+    try stdout.interface.flush();
 }
 
 fn kill(cfg: *Cfg, session_name: []const u8, force: bool) !void {
@@ -2527,6 +2629,26 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
     defer term.deinit(daemon.alloc);
     var vt_stream = term.vtStream();
     defer vt_stream.deinit();
+
+    // If this daemon was spawned by `zmx restore`, hydrate the VT from the
+    // snapshot captured before the previous incarnation died. The shell
+    // already exec'd at the recorded cwd above; the snapshot only restores
+    // visible state (scrollback + cursor + modes), not the live process.
+    if (daemon.restore_from_snapshot) {
+        const snap = persistence.readSnapshot(
+            daemon.alloc,
+            daemon.cfg.socket_dir,
+            daemon.session_name,
+        ) catch |err| blk: {
+            std.log.warn("snapshot read failed session={s} err={s}", .{ daemon.session_name, @errorName(err) });
+            break :blk null;
+        };
+        if (snap) |bytes| {
+            defer daemon.alloc.free(bytes);
+            vt_stream.nextSlice(bytes);
+            std.log.info("restored {d} bytes of VT state session={s}", .{ bytes.len, daemon.session_name });
+        }
+    }
 
     // Snapshot bookkeeping. Periodic dumps of the VT state to disk so that
     // `zmx restore` can rehydrate scrollback + cursor for sessions that

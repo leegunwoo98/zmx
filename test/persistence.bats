@@ -138,3 +138,52 @@ start_marked_session() {
   [ "$status" -eq 0 ]
   [ ! -f "$(snapshot_file snap-task)" ]
 }
+
+# ============================================================================
+# `zmx restore` — re-spawn sessions from the manifest after reboot
+# ============================================================================
+
+@test "restore: recreates a session from its manifest" {
+  # Create a session with a recognizable cwd + command
+  ( cd /tmp && "$ZMX" attach restore-basic bash -c "echo MARKER_BASIC; sleep 600" </dev/null >/dev/null 2>&1 & )
+  wait_for_session restore-basic
+  [ -f "$(manifest_file restore-basic)" ]
+
+  # SIGTERM the daemon → simulates a reboot
+  local pid
+  pid=$("$ZMX" list | grep restore-basic | sed -E 's/.*pid=([0-9]+).*/\1/')
+  kill -TERM "$pid"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    "$ZMX" list --short 2>/dev/null | grep -qx restore-basic || break
+    sleep 0.1
+  done
+  [ -f "$(manifest_file restore-basic)" ]  # survived
+
+  # Restore
+  run "$ZMX" restore
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"restored restore-basic"* ]]
+  [[ "$output" == *"restored=1"* ]]
+
+  # Session is alive again with the original metadata
+  wait_for_session restore-basic
+  run "$ZMX" list
+  [[ "$output" == *"name=restore-basic"* ]]
+  [[ "$output" == *"start_dir=/private/tmp"* ]] || [[ "$output" == *"start_dir=/tmp"* ]]
+  [[ "$output" == *'cmd=bash -c'* ]]
+}
+
+@test "restore: skips sessions that are already live" {
+  start_attached_session restore-live
+
+  run "$ZMX" restore
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"skip restore-live"* ]]
+  [[ "$output" == *"already running"* ]]
+}
+
+@test "restore: empty manifest dir prints \"no sessions to restore\"" {
+  run "$ZMX" restore
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no sessions to restore"* ]]
+}
