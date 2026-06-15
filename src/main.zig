@@ -601,6 +601,9 @@ const Daemon = struct {
     // shutdown_on_last); SIGTERM / system shutdown leave this false so the
     // manifest survives reboot for `zmx restore` to pick up.
     user_killed: bool = false,
+    // Set when the VT has received output since the last snapshot. Cleared
+    // each time we dump a snapshot to disk. Idle sessions don't write.
+    snapshot_dirty: bool = false,
 
     const EnsureSessionResult = struct {
         created: bool,
@@ -854,7 +857,8 @@ const Daemon = struct {
                 // Persist a manifest entry so `zmx restore` can re-spawn this
                 // session after reboot. Task-mode sessions are skipped (they
                 // exit when their command exits — no shell to restore).
-                if (!self.is_task_mode) {
+                const is_persistent = !self.is_task_mode;
+                if (is_persistent) {
                     persistence.writeManifest(self.alloc, self.cfg.socket_dir, self.cfg.dir_mode, .{
                         .name = self.session_name,
                         .cwd = self.cwd,
@@ -878,6 +882,9 @@ const Daemon = struct {
                     if (self.user_killed) {
                         persistence.removeManifest(self.alloc, self.cfg.socket_dir, self.session_name) catch |err| {
                             std.log.warn("manifest remove failed session={s} err={s}", .{ self.session_name, @errorName(err) });
+                        };
+                        persistence.removeSnapshot(self.alloc, self.cfg.socket_dir, self.session_name) catch |err| {
+                            std.log.warn("snapshot remove failed session={s} err={s}", .{ self.session_name, @errorName(err) });
                         };
                     }
                 }
@@ -2521,6 +2528,28 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
     var vt_stream = term.vtStream();
     defer vt_stream.deinit();
 
+    // Snapshot bookkeeping. Periodic dumps of the VT state to disk so that
+    // `zmx restore` can rehydrate scrollback + cursor for sessions that
+    // survived a reboot. Skips task-mode sessions (no scrollback worth
+    // restoring) and idle sessions (`snapshot_dirty == false`).
+    const SNAPSHOT_INTERVAL_NS: u64 = 30 * std.time.ns_per_s;
+    var last_snapshot_ns: u64 = @intCast(std.time.nanoTimestamp());
+    const snapshots_enabled = !daemon.is_task_mode;
+    defer if (snapshots_enabled and !daemon.user_killed) {
+        if (util.serializeTerminalState(daemon.alloc, &term)) |vt_data| {
+            defer daemon.alloc.free(vt_data);
+            persistence.writeSnapshot(
+                daemon.alloc,
+                daemon.cfg.socket_dir,
+                daemon.cfg.dir_mode,
+                daemon.session_name,
+                vt_data,
+            ) catch |err| {
+                std.log.warn("final snapshot failed session={s} err={s}", .{ daemon.session_name, @errorName(err) });
+            };
+        }
+    };
+
     daemon_loop: while (daemon.running) {
         poll_fds.clearRetainingCapacity();
 
@@ -2554,7 +2583,20 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
             });
         }
 
-        _ = try posix.poll(poll_fds.items, -1);
+        // Compute a poll timeout that wakes us when it's time to snapshot.
+        // -1 = block forever; otherwise millisecond ceiling until next snapshot.
+        var poll_timeout_ms: i32 = -1;
+        if (snapshots_enabled and daemon.snapshot_dirty) {
+            const now_ns: u64 = @intCast(std.time.nanoTimestamp());
+            const elapsed = now_ns -| last_snapshot_ns;
+            if (elapsed >= SNAPSHOT_INTERVAL_NS) {
+                poll_timeout_ms = 0;
+            } else {
+                const remaining_ms = @divFloor(SNAPSHOT_INTERVAL_NS - elapsed, std.time.ns_per_ms);
+                poll_timeout_ms = std.math.cast(i32, remaining_ms) orelse std.math.maxInt(i32);
+            }
+        }
+        _ = try posix.poll(poll_fds.items, poll_timeout_ms);
 
         if (poll_fds.items[2].revents & posix.POLL.IN != 0) {
             drainSignalPipe();
@@ -2563,6 +2605,28 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 .{daemon.session_name},
             );
             break :daemon_loop;
+        }
+
+        // Periodic snapshot dump. Idle-aware (only when dirty); the next
+        // PTY-read iteration will set dirty=true.
+        if (snapshots_enabled and daemon.snapshot_dirty) {
+            const now_ns: u64 = @intCast(std.time.nanoTimestamp());
+            if (now_ns -| last_snapshot_ns >= SNAPSHOT_INTERVAL_NS) {
+                if (util.serializeTerminalState(daemon.alloc, &term)) |vt_data| {
+                    defer daemon.alloc.free(vt_data);
+                    persistence.writeSnapshot(
+                        daemon.alloc,
+                        daemon.cfg.socket_dir,
+                        daemon.cfg.dir_mode,
+                        daemon.session_name,
+                        vt_data,
+                    ) catch |err| {
+                        std.log.warn("snapshot write failed session={s} err={s}", .{ daemon.session_name, @errorName(err) });
+                    };
+                }
+                last_snapshot_ns = now_ns;
+                daemon.snapshot_dirty = false;
+            }
         }
 
         if (poll_fds.items[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) {
@@ -2608,6 +2672,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     // Feed PTY output to terminal emulator for state tracking
                     vt_stream.nextSlice(buf[0..n]);
                     daemon.has_pty_output = true;
+                    daemon.snapshot_dirty = true;
 
                     // When no real terminal client has attached yet, respond to
                     // terminal queries (e.g. DA1/DA2) on behalf of the terminal.

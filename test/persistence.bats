@@ -82,3 +82,59 @@ start_attached_session() {
   [ "$status" -eq 0 ]
   [ ! -f "$(manifest_file task-mode-test)" ]
 }
+
+# ============================================================================
+# Snapshot (VT terminal state dump)
+# ============================================================================
+
+snapshot_file() {
+  echo "$ZMX_DIR/snapshots/$1.vt"
+}
+
+# Boot a session that prints a known marker and then sleeps. Used to verify
+# the snapshot captures live terminal content.
+start_marked_session() {
+  local name="$1" marker="$2"
+  ( "$ZMX" attach "$name" bash -c "echo $marker; sleep 600" </dev/null >/dev/null 2>&1 & )
+  wait_for_session "$name"
+  sleep 0.5  # let the bash spawn + echo propagate through the VT
+}
+
+@test "snapshot: written on SIGTERM with the live VT contents" {
+  start_marked_session snap-sigterm SNAPSHOT_MARKER_SIGTERM
+
+  local pid
+  pid=$("$ZMX" list | grep snap-sigterm | sed -E 's/.*pid=([0-9]+).*/\1/')
+  [ -n "$pid" ]
+  kill -TERM "$pid"
+
+  # Wait for the daemon to exit (socket goes away)
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    "$ZMX" list --short 2>/dev/null | grep -qx snap-sigterm || break
+    sleep 0.1
+  done
+
+  [ -f "$(snapshot_file snap-sigterm)" ]
+  # Snapshot is VT bytes — strip escapes and grep for the marker
+  run cat "$(snapshot_file snap-sigterm)"
+  [[ "$output" == *"SNAPSHOT_MARKER_SIGTERM"* ]]
+}
+
+@test "snapshot: removed on explicit \`zmx kill\` (no zombie restore data)" {
+  start_marked_session snap-kill SNAPSHOT_MARKER_KILL
+  # Even before the periodic timer fires, kill triggers the cleanup branch
+  "$ZMX" kill snap-kill
+
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ ! -f "$(snapshot_file snap-kill)" ] && [ ! -f "$(manifest_file snap-kill)" ] && break
+    sleep 0.1
+  done
+  [ ! -f "$(snapshot_file snap-kill)" ]
+  [ ! -f "$(manifest_file snap-kill)" ]
+}
+
+@test "snapshot: NOT written for task-mode sessions" {
+  run env SHELL=/bin/bash "$ZMX" run snap-task echo hi
+  [ "$status" -eq 0 ]
+  [ ! -f "$(snapshot_file snap-task)" ]
+}

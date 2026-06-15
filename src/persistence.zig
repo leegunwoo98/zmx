@@ -95,6 +95,98 @@ pub fn removeManifest(
     };
 }
 
+// ----------------------------------------------------------------------------
+// Snapshot: VT terminal state dump that `zmx restore` replays into a fresh
+// ghostty-vt to rehydrate scrollback + cursor for a recovered session.
+//
+// Layout: {socket_dir}/snapshots/{session_name}.vt  (raw VT escape bytes)
+// ----------------------------------------------------------------------------
+
+fn snapshotDirPath(alloc: std.mem.Allocator, socket_dir: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}/snapshots", .{socket_dir});
+}
+
+fn snapshotFileName(alloc: std.mem.Allocator, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}.vt", .{name});
+}
+
+/// Write VT-encoded terminal state atomically.
+pub fn writeSnapshot(
+    alloc: std.mem.Allocator,
+    socket_dir: []const u8,
+    dir_mode: u32,
+    name: []const u8,
+    vt_data: []const u8,
+) !void {
+    const dir_path = try snapshotDirPath(alloc, socket_dir);
+    defer alloc.free(dir_path);
+    posix.mkdirat(posix.AT.FDCWD, dir_path, @intCast(dir_mode)) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    var dir = try std.fs.openDirAbsolute(dir_path, .{});
+    defer dir.close();
+
+    const final_name = try snapshotFileName(alloc, name);
+    defer alloc.free(final_name);
+    const tmp_name = try std.fmt.allocPrint(alloc, "{s}.tmp", .{final_name});
+    defer alloc.free(tmp_name);
+
+    var file = try dir.createFile(tmp_name, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(vt_data);
+
+    try dir.rename(tmp_name, final_name);
+}
+
+pub fn removeSnapshot(
+    alloc: std.mem.Allocator,
+    socket_dir: []const u8,
+    name: []const u8,
+) !void {
+    const dir_path = try snapshotDirPath(alloc, socket_dir);
+    defer alloc.free(dir_path);
+
+    var dir = std.fs.openDirAbsolute(dir_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close();
+
+    const final_name = try snapshotFileName(alloc, name);
+    defer alloc.free(final_name);
+    dir.deleteFile(final_name) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+/// Read a snapshot file into a freshly-allocated buffer. Caller frees.
+/// Returns null if the file is missing.
+pub fn readSnapshot(
+    alloc: std.mem.Allocator,
+    socket_dir: []const u8,
+    name: []const u8,
+) !?[]u8 {
+    const dir_path = try snapshotDirPath(alloc, socket_dir);
+    defer alloc.free(dir_path);
+    var dir = std.fs.openDirAbsolute(dir_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer dir.close();
+
+    const final_name = try snapshotFileName(alloc, name);
+    defer alloc.free(final_name);
+
+    const max_size: usize = 64 * 1024 * 1024; // 64 MiB cap — scrollback for very long sessions
+    return dir.readFileAlloc(alloc, final_name, max_size) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => err,
+    };
+}
+
 /// Owned manifest list. Caller must call deinit() to free the backing arena.
 /// All slice fields inside `items` live in the arena.
 pub const ManifestList = struct {
@@ -203,6 +295,33 @@ test "writeManifest persists a command argv" {
     try std.testing.expect(list.items[0].command != null);
     try std.testing.expectEqual(@as(usize, 2), list.items[0].command.?.len);
     try std.testing.expectEqualStrings("nvim", list.items[0].command.?[0]);
+}
+
+test "writeSnapshot then readSnapshot roundtrips the VT payload" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const socket_dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(socket_dir);
+
+    const payload = "\x1b[H\x1b[2Jhello vt\x1b[0m";
+    try writeSnapshot(alloc, socket_dir, 0o750, "alpha", payload);
+
+    const read_back = try readSnapshot(alloc, socket_dir, "alpha");
+    try std.testing.expect(read_back != null);
+    defer alloc.free(read_back.?);
+    try std.testing.expectEqualStrings(payload, read_back.?);
+}
+
+test "readSnapshot returns null for a missing session" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const socket_dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(socket_dir);
+
+    const result = try readSnapshot(alloc, socket_dir, "absent");
+    try std.testing.expectEqual(@as(?[]u8, null), result);
 }
 
 test "removeManifest is a no-op when the file is missing" {
