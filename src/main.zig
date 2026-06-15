@@ -8,6 +8,7 @@ const completions = @import("completions.zig");
 const util = @import("util.zig");
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
+const persistence = @import("persistence.zig");
 
 pub const version = build_options.version;
 pub const ghostty_version = build_options.ghostty_version;
@@ -596,6 +597,10 @@ const Daemon = struct {
     task_ended_at: ?u64 = null, // timestamp when task exited
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
     pty_write_buf: std.ArrayList(u8) = .empty,
+    // True only when the user explicitly killed the session (via `zmx kill` or
+    // shutdown_on_last); SIGTERM / system shutdown leave this false so the
+    // manifest survives reboot for `zmx restore` to pick up.
+    user_killed: bool = false,
 
     const EnsureSessionResult = struct {
         created: bool,
@@ -846,6 +851,20 @@ const Daemon = struct {
                     return err;
                 };
 
+                // Persist a manifest entry so `zmx restore` can re-spawn this
+                // session after reboot. Task-mode sessions are skipped (they
+                // exit when their command exits — no shell to restore).
+                if (!self.is_task_mode) {
+                    persistence.writeManifest(self.alloc, self.cfg.socket_dir, self.cfg.dir_mode, .{
+                        .name = self.session_name,
+                        .cwd = self.cwd,
+                        .command = self.command,
+                        .created_at_ns = self.created_at,
+                    }) catch |err| {
+                        std.log.warn("manifest write failed session={s} err={s}", .{ self.session_name, @errorName(err) });
+                    };
+                }
+
                 defer {
                     self.handleKill();
                     self.deinit();
@@ -856,6 +875,11 @@ const Daemon = struct {
                     dir.deleteFile(self.session_name) catch |err| {
                         std.log.warn("failed to delete socket file err={s}", .{@errorName(err)});
                     };
+                    if (self.user_killed) {
+                        persistence.removeManifest(self.alloc, self.cfg.socket_dir, self.session_name) catch |err| {
+                            std.log.warn("manifest remove failed session={s} err={s}", .{ self.session_name, @errorName(err) });
+                        };
+                    }
                 }
 
                 try daemonLoop(self, server_sock_fd, pty_fd);
@@ -2697,6 +2721,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                             break :clients_loop;
                         },
                         .Kill => {
+                            daemon.user_killed = true;
                             break :daemon_loop;
                         },
                         .Info => try daemon.handleInfo(client),
