@@ -32,7 +32,7 @@ const bash_completions =
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
     \\
-    \\  local commands="attach run send detach list completions kill history version help"
+    \\  local commands="attach run send detach list completions kill restore history wait tail write version help"
     \\
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -81,6 +81,7 @@ const zsh_completions =
     \\        'list:List active sessions'
     \\        'completions:Shell completion scripts'
     \\        'kill:Kill a session'
+    \\        'restore:Re-spawn sessions saved across reboots'
     \\        'history:Output session scrollback'
     \\        'version:Show version'
     \\        'help:Show help message'
@@ -135,6 +136,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 1" -a detach -d 'Detach all clients (ctrl+\ for current client)'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a list -d 'List active sessions'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a kill -d 'Kill session and all attached clients'
+    \\complete -c zmx -n "__fish_is_nth_token 1" -a restore -d 'Re-spawn sessions saved across reboots'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a history -d 'Output session scrollback'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a wait -d 'Wait for session tasks to complete'
     \\complete -c zmx -n "__fish_is_nth_token 1" -a tail -d 'Follow session output'
@@ -189,6 +191,7 @@ const nu_completions =
     \\]
     \\
     \\export extern "zmx detach" []
+    \\export extern "zmx restore" []
     \\export extern "zmx list" [--short]
     \\export extern "zmx history" [name: string@"nu-complete zmx sessions", --vt, --html]
     \\export extern "zmx wait" [...sessions: string@"nu-complete zmx sessions"]

@@ -187,3 +187,86 @@ start_marked_session() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"no sessions to restore"* ]]
 }
+
+# ============================================================================
+# Review-feedback fixes (red-green verified)
+# ============================================================================
+
+@test "restore: FAILS sessions whose cwd no longer exists (S6)" {
+  # Hand-craft a manifest pointing at a directory that doesn't exist
+  mkdir -p "$ZMX_DIR/manifest"
+  cat > "$ZMX_DIR/manifest/ghost-cwd.json" <<'EOF'
+{
+  "version": 1,
+  "name": "ghost-cwd",
+  "cwd": "/nonexistent/path/that/does/not/exist",
+  "command": null,
+  "created_at_ns": 1
+}
+EOF
+
+  run "$ZMX" restore
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"FAILED ghost-cwd"* ]]
+  [[ "$output" == *"unreachable"* ]]
+  [[ "$output" == *"failed=1"* ]]
+  # Session should NOT exist
+  run "$ZMX" list --short
+  [[ "$output" != *"ghost-cwd"* ]]
+}
+
+@test "restore: surfaces unparseable manifests via parse_errors (S7)" {
+  mkdir -p "$ZMX_DIR/manifest"
+  # Two files: one valid, one truncated/corrupt
+  cat > "$ZMX_DIR/manifest/corrupt.json" <<'EOF'
+{ "version": 1, "name": "corrupt", "cwd"
+EOF
+  # No valid manifests — just the corrupt one. Restore should report it.
+  run "$ZMX" restore
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"parse_errors=1"* ]]
+  [[ "$output" == *"no parseable sessions"* ]]
+}
+
+@test "restore: sweeps orphan .tmp files left by crash mid-write" {
+  mkdir -p "$ZMX_DIR/manifest" "$ZMX_DIR/snapshots"
+  touch "$ZMX_DIR/manifest/zombie.json.tmp"
+  touch "$ZMX_DIR/snapshots/zombie.vt.tmp"
+  [ -f "$ZMX_DIR/manifest/zombie.json.tmp" ]
+  [ -f "$ZMX_DIR/snapshots/zombie.vt.tmp" ]
+
+  "$ZMX" restore >/dev/null
+
+  [ ! -f "$ZMX_DIR/manifest/zombie.json.tmp" ]
+  [ ! -f "$ZMX_DIR/snapshots/zombie.vt.tmp" ]
+}
+
+@test "snapshot: ZMX_SNAPSHOT_INTERVAL_MS triggers periodic dump" {
+  # Override the 30-second default with a 200ms interval, then generate some
+  # output and wait long enough for the periodic path (not the SIGTERM defer)
+  # to write the snapshot file.
+  ( ZMX_SNAPSHOT_INTERVAL_MS=200 "$ZMX" attach snap-fast bash -c "echo PERIODIC_MARKER; sleep 600" </dev/null >/dev/null 2>&1 & )
+  wait_for_session snap-fast
+
+  # Wait > interval. Periodic dump path is dirty + elapsed >= interval.
+  sleep 1.0
+  [ -f "$ZMX_DIR/snapshots/snap-fast.vt" ]
+  run cat "$ZMX_DIR/snapshots/snap-fast.vt"
+  [[ "$output" == *"PERIODIC_MARKER"* ]]
+}
+
+@test "manifest: writeManifest failure aborts \`zmx attach\` (S1)" {
+  # Make the manifest dir un-writable so writeManifest fails BEFORE fork.
+  # The parent should surface a real error instead of producing a ghost session.
+  mkdir -p "$ZMX_DIR/manifest"
+  chmod 0555 "$ZMX_DIR/manifest"
+
+  # Use \`run\` so we capture the failure without aborting the test
+  run env "$ZMX" attach denied-write bash -c "echo hi; sleep 60"
+  # restore mode for the next test
+  chmod 0755 "$ZMX_DIR/manifest"
+
+  # Either non-zero exit OR explicit error output is acceptable.
+  # Critical assertion: no socket file was created (no ghost daemon).
+  [ ! -e "$ZMX_DIR/denied-write" ]
+}

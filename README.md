@@ -20,6 +20,7 @@
 - Native terminal scrollback
 - Multiple clients can connect to the same session
 - Re-attaching to a session restores previous terminal state and output
+- Sessions survive reboots: `zmx restore` re-spawns them with their original cwd + scrollback (see `zmx restore --help`)
 - Send commands to a session without attaching to it
 - Print scrollback history of a terminal session in plain text
 - Works on mac and linux
@@ -85,6 +86,7 @@ Commands:
   [d]etach                                 Detach all clients (ctrl+\\ for current client)
   [l]ist|ls [--short]                      List active sessions
   [k]ill <name>... [--force]               Kill session and all attached clients
+  restore                                  Re-spawn sessions saved across reboots
   [hi]story <name> [--vt|--html]           Output session scrollback
   [w]ait <name>...                         Wait for session tasks to complete
   [t]ail <name>...                         Follow session output

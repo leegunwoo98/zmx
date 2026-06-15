@@ -802,6 +802,20 @@ const Daemon = struct {
 
         if (should_create) {
             std.log.info("creating session={s}", .{self.session_name});
+
+            // Persist the manifest BEFORE fork so write failures (ENOSPC,
+            // permission denied, etc.) surface to the user directly. After
+            // fork the daemon child's stdio is redirected to /dev/null and a
+            // warning would be invisible. Task-mode sessions don't restore.
+            if (!self.is_task_mode) {
+                try persistence.writeManifest(self.alloc, self.cfg.socket_dir, self.cfg.dir_mode, .{
+                    .name = self.session_name,
+                    .cwd = self.cwd,
+                    .command = self.command,
+                    .created_at_ns = self.created_at,
+                });
+            }
+
             const server_sock_fd = try socket.createSocket(self.socket_path);
 
             // creates the daemon
@@ -876,21 +890,6 @@ const Daemon = struct {
                     dir.deleteFile(self.session_name) catch {};
                     return err;
                 };
-
-                // Persist a manifest entry so `zmx restore` can re-spawn this
-                // session after reboot. Task-mode sessions are skipped (they
-                // exit when their command exits — no shell to restore).
-                const is_persistent = !self.is_task_mode;
-                if (is_persistent) {
-                    persistence.writeManifest(self.alloc, self.cfg.socket_dir, self.cfg.dir_mode, .{
-                        .name = self.session_name,
-                        .cwd = self.cwd,
-                        .command = self.command,
-                        .created_at_ns = self.created_at,
-                    }) catch |err| {
-                        std.log.warn("manifest write failed session={s} err={s}", .{ self.session_name, @errorName(err) });
-                    };
-                }
 
                 defer {
                     self.handleKill();
@@ -1313,7 +1312,7 @@ fn help() !void {
         \\  [d]etach                                 Detach all clients (ctrl+\\ for current client)
         \\  [l]ist|ls [--short]                      List active sessions
         \\  [k]ill <name>... [--force]               Kill session and all attached clients
-        \\  restore                                  Re-spawn sessions recorded under SOCKET_DIR/manifest
+        \\  restore                                  Re-spawn sessions saved across reboots
         \\  [hi]story <name> [--vt|--html]           Output session scrollback
         \\  [w]ait <name>...                         Wait for session tasks to complete
         \\  [t]ail <name>...                         Follow session output
@@ -1806,6 +1805,12 @@ fn detachAll(cfg: *Cfg) !void {
 /// with a missing cwd are still spawned -- the chdir is best-effort and
 /// daemonLoop will start the shell in the parent's cwd with a warning.
 fn restoreSessions(cfg: *Cfg, alloc: std.mem.Allocator) !void {
+    // Best-effort: remove orphan ".tmp" files left by a crash mid-write
+    // before iterating the manifest dir. Failure to sweep is non-fatal.
+    persistence.sweepTmpOrphans(alloc, cfg.socket_dir) catch |err| {
+        std.log.warn("tmp orphan sweep failed err={s}", .{@errorName(err)});
+    };
+
     var list_result = try persistence.readAll(alloc, cfg.socket_dir);
     defer list_result.deinit();
 
@@ -1813,7 +1818,14 @@ fn restoreSessions(cfg: *Cfg, alloc: std.mem.Allocator) !void {
     var stdout = std.fs.File.stdout().writer(&stdout_buf);
 
     if (list_result.items.len == 0) {
-        try stdout.interface.print("no sessions to restore\n", .{});
+        if (list_result.parse_errors > 0) {
+            try stdout.interface.print(
+                "no parseable sessions to restore (parse_errors={d})\n",
+                .{list_result.parse_errors},
+            );
+        } else {
+            try stdout.interface.print("no sessions to restore\n", .{});
+        }
         try stdout.interface.flush();
         return;
     }
@@ -1823,22 +1835,41 @@ fn restoreSessions(cfg: *Cfg, alloc: std.mem.Allocator) !void {
     var failed: usize = 0;
 
     for (list_result.items) |m| {
-        const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, m.name) catch |err| {
-            std.log.warn("getSocketPath failed session={s} err={s}", .{ m.name, @errorName(err) });
+        // Validate the recorded cwd before spawning. If the directory is gone
+        // (e.g. ephemeral mount unmounted, project deleted), abort early with
+        // a clear message instead of silently landing in the restoring user's
+        // cwd via execChild's best-effort chdir warning.
+        std.fs.accessAbsolute(m.cwd, .{}) catch |err| {
+            try stdout.interface.print(
+                "FAILED {s}: cwd {s} unreachable ({s})\n",
+                .{ m.name, m.cwd, @errorName(err) },
+            );
+            try stdout.interface.flush();
             failed += 1;
             continue;
         };
-        defer alloc.free(socket_path);
+
+        const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, m.name) catch |err| {
+            try stdout.interface.print(
+                "FAILED {s}: getSocketPath ({s})\n",
+                .{ m.name, @errorName(err) },
+            );
+            try stdout.interface.flush();
+            failed += 1;
+            continue;
+        };
 
         // Skip if a daemon is already serving this session
         if (ipc.connectSession(socket_path)) |fd| {
             posix.close(fd);
+            alloc.free(socket_path);
             try stdout.interface.print("skip {s} (already running)\n", .{m.name});
             try stdout.interface.flush();
             skipped += 1;
             continue;
         } else |_| {}
 
+        // From here on, socket_path is owned by the Daemon (freed by deinit).
         const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
         var daemon = Daemon{
             .running = true,
@@ -1856,15 +1887,24 @@ fn restoreSessions(cfg: *Cfg, alloc: std.mem.Allocator) !void {
         };
 
         const result = daemon.ensureSession() catch |err| {
-            std.log.warn("ensureSession failed session={s} err={s}", .{ m.name, @errorName(err) });
+            try stdout.interface.print(
+                "FAILED {s}: ensureSession ({s})\n",
+                .{ m.name, @errorName(err) },
+            );
+            try stdout.interface.flush();
+            daemon.deinit();
             failed += 1;
             continue;
         };
 
-        // If we're the forked daemon child, daemonLoop already returned. Exit
-        // the restore loop so the child process unwinds cleanly. The parent
-        // (the user's `zmx restore` invocation) continues with the next entry.
+        // If we're the forked daemon child, daemonLoop already returned and
+        // its cleanup defer ran Daemon.deinit() for us. Returning here lets
+        // the child process unwind cleanly without re-freeing.
         if (result.is_daemon) return;
+
+        // Parent: hand-off complete, release the Daemon scaffold we built.
+        daemon.deinit();
+
         if (result.created) {
             try stdout.interface.print("restored {s} (cwd={s})\n", .{ m.name, m.cwd });
             try stdout.interface.flush();
@@ -1873,8 +1913,8 @@ fn restoreSessions(cfg: *Cfg, alloc: std.mem.Allocator) !void {
     }
 
     try stdout.interface.print(
-        "\nrestored={d} skipped={d} failed={d}\n",
-        .{ restored, skipped, failed },
+        "\nrestored={d} skipped={d} failed={d} parse_errors={d}\n",
+        .{ restored, skipped, failed, list_result.parse_errors },
     );
     try stdout.interface.flush();
 }
@@ -2654,8 +2694,17 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
     // `zmx restore` can rehydrate scrollback + cursor for sessions that
     // survived a reboot. Skips task-mode sessions (no scrollback worth
     // restoring) and idle sessions (`snapshot_dirty == false`).
-    const SNAPSHOT_INTERVAL_NS: u64 = 30 * std.time.ns_per_s;
-    var last_snapshot_ns: u64 = @intCast(std.time.nanoTimestamp());
+    //
+    // Interval defaults to 30s. Override via ZMX_SNAPSHOT_INTERVAL_MS (useful
+    // for tests + power users who want denser snapshots on slow disks).
+    const snapshot_interval_ns: u64 = blk: {
+        const default_ns: u64 = 30 * std.time.ns_per_s;
+        const override = posix.getenv("ZMX_SNAPSHOT_INTERVAL_MS") orelse break :blk default_ns;
+        const ms = std.fmt.parseInt(u64, override, 10) catch break :blk default_ns;
+        break :blk ms * std.time.ns_per_ms;
+    };
+    // Timer is monotonic and survives suspend/wall-clock skew correctly.
+    var snapshot_timer = try std.time.Timer.start();
     const snapshots_enabled = !daemon.is_task_mode;
     defer if (snapshots_enabled and !daemon.user_killed) {
         if (util.serializeTerminalState(daemon.alloc, &term)) |vt_data| {
@@ -2667,8 +2716,10 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 daemon.session_name,
                 vt_data,
             ) catch |err| {
-                std.log.warn("final snapshot failed session={s} err={s}", .{ daemon.session_name, @errorName(err) });
+                std.log.err("final snapshot write failed session={s} err={s}", .{ daemon.session_name, @errorName(err) });
             };
+        } else {
+            std.log.err("final snapshot serialize returned null session={s}", .{daemon.session_name});
         }
     };
 
@@ -2709,12 +2760,11 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
         // -1 = block forever; otherwise millisecond ceiling until next snapshot.
         var poll_timeout_ms: i32 = -1;
         if (snapshots_enabled and daemon.snapshot_dirty) {
-            const now_ns: u64 = @intCast(std.time.nanoTimestamp());
-            const elapsed = now_ns -| last_snapshot_ns;
-            if (elapsed >= SNAPSHOT_INTERVAL_NS) {
+            const elapsed = snapshot_timer.read();
+            if (elapsed >= snapshot_interval_ns) {
                 poll_timeout_ms = 0;
             } else {
-                const remaining_ms = @divFloor(SNAPSHOT_INTERVAL_NS - elapsed, std.time.ns_per_ms);
+                const remaining_ms = @divFloor(snapshot_interval_ns - elapsed, std.time.ns_per_ms);
                 poll_timeout_ms = std.math.cast(i32, remaining_ms) orelse std.math.maxInt(i32);
             }
         }
@@ -2730,25 +2780,29 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
         }
 
         // Periodic snapshot dump. Idle-aware (only when dirty); the next
-        // PTY-read iteration will set dirty=true.
-        if (snapshots_enabled and daemon.snapshot_dirty) {
-            const now_ns: u64 = @intCast(std.time.nanoTimestamp());
-            if (now_ns -| last_snapshot_ns >= SNAPSHOT_INTERVAL_NS) {
-                if (util.serializeTerminalState(daemon.alloc, &term)) |vt_data| {
-                    defer daemon.alloc.free(vt_data);
-                    persistence.writeSnapshot(
-                        daemon.alloc,
-                        daemon.cfg.socket_dir,
-                        daemon.cfg.dir_mode,
-                        daemon.session_name,
-                        vt_data,
-                    ) catch |err| {
-                        std.log.warn("snapshot write failed session={s} err={s}", .{ daemon.session_name, @errorName(err) });
-                    };
-                }
-                last_snapshot_ns = now_ns;
-                daemon.snapshot_dirty = false;
+        // PTY-read iteration will set dirty=true. We advance the timer on
+        // either branch to cap retry rate, but only clear `snapshot_dirty`
+        // on a successful serialize+write -- otherwise a transient null from
+        // the serializer would lose the dirty signal until the next PTY byte.
+        if (snapshots_enabled and daemon.snapshot_dirty and snapshot_timer.read() >= snapshot_interval_ns) {
+            var write_ok = false;
+            if (util.serializeTerminalState(daemon.alloc, &term)) |vt_data| {
+                defer daemon.alloc.free(vt_data);
+                persistence.writeSnapshot(
+                    daemon.alloc,
+                    daemon.cfg.socket_dir,
+                    daemon.cfg.dir_mode,
+                    daemon.session_name,
+                    vt_data,
+                ) catch |err| {
+                    std.log.err("snapshot write failed session={s} err={s}", .{ daemon.session_name, @errorName(err) });
+                };
+                write_ok = true;
+            } else {
+                std.log.err("snapshot serialize returned null session={s}", .{daemon.session_name});
             }
+            snapshot_timer.reset();
+            if (write_ok) daemon.snapshot_dirty = false;
         }
 
         if (poll_fds.items[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) {

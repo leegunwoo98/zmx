@@ -4,6 +4,15 @@ Use spec: https://common-changelog.org/
 
 ## Staged
 
+### Added
+
+- `zmx restore` re-spawns sessions that died with the daemon (reboot, crash, manual SIGTERM)
+  - Each session writes a JSON manifest at `{socket_dir}/manifest/{name}.json` on create and removes it on user-initiated `zmx kill`
+  - The daemon dumps the live ghostty-vt state to `{socket_dir}/snapshots/{name}.vt` every 30 seconds (idle-aware) and on graceful shutdown; restore replays it into the new daemon
+  - `ZMX_SNAPSHOT_INTERVAL_MS` overrides the default 30-second snapshot interval
+  - Task-mode sessions (`zmx run …`) are not persisted; their command has already exited
+  - See issue [#76](https://github.com/neurosnap/zmx/issues/76)
+
 ## v0.7.0 - 2026-05-29
 
 ### Fixed

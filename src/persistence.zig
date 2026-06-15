@@ -33,12 +33,53 @@ fn manifestFileName(alloc: std.mem.Allocator, name: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "{s}.json", .{name});
 }
 
-fn ensureManifestDir(socket_dir: []const u8, dir_path: []const u8, dir_mode: u32) !void {
-    _ = socket_dir;
+fn ensureDir(dir_path: []const u8, dir_mode: u32) !void {
     posix.mkdirat(posix.AT.FDCWD, dir_path, @intCast(dir_mode)) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
+}
+
+/// fsync the file then atomically rename, then fsync the parent dir so the
+/// directory entry survives a crash/reboot. Without the dir fsync the rename
+/// can be lost after a power loss even though `rename` returned success.
+fn syncRenameDurable(dir: std.fs.Dir, file: std.fs.File, tmp_name: []const u8, final_name: []const u8) !void {
+    try file.sync();
+    try dir.rename(tmp_name, final_name);
+    // std.fs.Dir has no sync() in zig 0.15; fsync the underlying fd directly.
+    posix.fsync(@intCast(dir.fd)) catch |err| switch (err) {
+        // Some filesystems (e.g. tmpfs on certain Linux kernels) reject
+        // fsync on directories. The rename already returned; missing dir
+        // fsync degrades durability slightly but is not a write failure.
+        error.AccessDenied, error.InputOutput => std.log.warn("dir fsync rejected err={s}", .{@errorName(err)}),
+        else => return err,
+    };
+}
+
+/// Remove orphan ".tmp" files left by a crash mid-write. Called once at
+/// startup of any flow that iterates the manifest or snapshot dirs.
+pub fn sweepTmpOrphans(alloc: std.mem.Allocator, socket_dir: []const u8) !void {
+    try sweepTmpOrphansIn(alloc, socket_dir, "manifest");
+    try sweepTmpOrphansIn(alloc, socket_dir, "snapshots");
+}
+
+fn sweepTmpOrphansIn(alloc: std.mem.Allocator, socket_dir: []const u8, sub: []const u8) !void {
+    const dir_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ socket_dir, sub });
+    defer alloc.free(dir_path);
+    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.endsWith(u8, entry.name, ".tmp")) {
+            dir.deleteFile(entry.name) catch |err| {
+                std.log.warn("sweep tmp file={s} err={s}", .{ entry.name, @errorName(err) });
+            };
+        }
+    }
 }
 
 /// Write the manifest atomically: write to "{name}.json.tmp" then rename.
@@ -50,7 +91,7 @@ pub fn writeManifest(
 ) !void {
     const dir_path = try manifestDirPath(alloc, socket_dir);
     defer alloc.free(dir_path);
-    try ensureManifestDir(socket_dir, dir_path, dir_mode);
+    try ensureDir(dir_path, dir_mode);
 
     var dir = try std.fs.openDirAbsolute(dir_path, .{});
     defer dir.close();
@@ -68,7 +109,7 @@ pub fn writeManifest(
     try std.json.Stringify.value(manifest, .{ .whitespace = .indent_2 }, &w.interface);
     try w.interface.flush();
 
-    try dir.rename(tmp_name, final_name);
+    try syncRenameDurable(dir, file, tmp_name, final_name);
 }
 
 /// Remove a session's manifest. Missing file is not an error.
@@ -120,10 +161,7 @@ pub fn writeSnapshot(
 ) !void {
     const dir_path = try snapshotDirPath(alloc, socket_dir);
     defer alloc.free(dir_path);
-    posix.mkdirat(posix.AT.FDCWD, dir_path, @intCast(dir_mode)) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
+    try ensureDir(dir_path, dir_mode);
 
     var dir = try std.fs.openDirAbsolute(dir_path, .{});
     defer dir.close();
@@ -137,7 +175,7 @@ pub fn writeSnapshot(
     defer file.close();
     try file.writeAll(vt_data);
 
-    try dir.rename(tmp_name, final_name);
+    try syncRenameDurable(dir, file, tmp_name, final_name);
 }
 
 pub fn removeSnapshot(
@@ -188,9 +226,12 @@ pub fn readSnapshot(
 }
 
 /// Owned manifest list. Caller must call deinit() to free the backing arena.
-/// All slice fields inside `items` live in the arena.
+/// All slice fields inside `items` live in the arena. `parse_errors` counts
+/// files in the manifest dir that could not be read or parsed -- surface to
+/// the user so a corrupt file doesn't silently shrink the restored set.
 pub const ManifestList = struct {
     items: []Manifest,
+    parse_errors: usize,
     arena: *std.heap.ArenaAllocator,
 
     pub fn deinit(self: *ManifestList) void {
@@ -213,10 +254,12 @@ pub fn readAll(alloc: std.mem.Allocator, socket_dir: []const u8) !ManifestList {
     defer alloc.free(dir_path);
 
     var items: std.ArrayList(Manifest) = .empty;
+    var parse_errors: usize = 0;
 
     var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return .{
             .items = try arena.alloc(Manifest, 0),
+            .parse_errors = 0,
             .arena = arena_ptr,
         },
         else => return err,
@@ -231,6 +274,7 @@ pub fn readAll(alloc: std.mem.Allocator, socket_dir: []const u8) !ManifestList {
         const max_size: usize = 64 * 1024;
         const contents = dir.readFileAlloc(arena, entry.name, max_size) catch |err| {
             std.log.warn("manifest read failed file={s} err={s}", .{ entry.name, @errorName(err) });
+            parse_errors += 1;
             continue;
         };
 
@@ -238,12 +282,13 @@ pub fn readAll(alloc: std.mem.Allocator, socket_dir: []const u8) !ManifestList {
             .ignore_unknown_fields = true,
         }) catch |err| {
             std.log.warn("manifest parse failed file={s} err={s}", .{ entry.name, @errorName(err) });
+            parse_errors += 1;
             continue;
         };
         try items.append(arena, manifest);
     }
 
-    return .{ .items = items.items, .arena = arena_ptr };
+    return .{ .items = items.items, .parse_errors = parse_errors, .arena = arena_ptr };
 }
 
 // ============================================================================
