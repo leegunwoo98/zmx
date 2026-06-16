@@ -525,6 +525,32 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         term.modes.set(.synchronized_output, false);
     }
 
+    // Mouse-tracking modes belong to the *program* that enabled them, not
+    // to the terminal state. If a TUI (vim, claude code, htop) enabled mouse
+    // reporting and didn't reset on exit (Ctrl-C, crash), serializing those
+    // modes here re-enables them in every reattaching client / restored
+    // daemon. The freshly spawned shell doesn't consume mouse events, so
+    // every wheel tick gets typed at the prompt as SGR sequences (e.g.
+    // `<65;58;22M`). Strip on serialize; programs re-enable on launch.
+    //
+    // Note: `mouse_alternate_scroll` (1007) is a TERM_PROGRAM preference,
+    // not active tracking, so leave it alone.
+    const stripped_mouse_modes = [_]ghostty_vt.modes.Mode{
+        .mouse_event_x10,
+        .mouse_event_normal,
+        .mouse_event_button,
+        .mouse_event_any,
+        .mouse_format_utf8,
+        .mouse_format_sgr,
+        .mouse_format_urxvt,
+        .mouse_format_sgr_pixels,
+    };
+    var saved_mouse: [stripped_mouse_modes.len]bool = undefined;
+    inline for (stripped_mouse_modes, 0..) |mode, i| {
+        saved_mouse[i] = term.modes.get(mode);
+        if (saved_mouse[i]) term.modes.set(mode, false);
+    }
+
     const pages = &term.screens.active.pages;
     const screen_top = pages.getTopLeft(.screen);
     const active_top = pages.getTopLeft(.active);
@@ -612,6 +638,11 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
     // Restore the original synchronized_output mode before returning
     if (had_synchronized_output) {
         term.modes.set(.synchronized_output, true);
+    }
+    // Restore mouse modes (the live program still needs them; we only
+    // stripped them from the serialized output bytes).
+    inline for (stripped_mouse_modes, 0..) |mode, i| {
+        if (saved_mouse[i]) term.modes.set(mode, true);
     }
 
     return alloc.dupe(u8, output) catch |err| {
@@ -1001,6 +1032,43 @@ test "isCtrlBackslash" {
 
     // Other CSI u sequences that happen to contain '92' elsewhere
     try expect(!isCtrlBackslash("\x1b[65;92u"));
+}
+
+test "serializeTerminalState strips mouse tracking modes but preserves them on the live term" {
+    const alloc = testing.allocator;
+
+    var term = try ghostty_vt.Terminal.init(alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    stream.nextSlice("\x1b[?1000h"); // X10 compat mouse (most common stuck mode)
+    stream.nextSlice("\x1b[?1006h"); // SGR mouse encoding
+    stream.nextSlice("\x1b[?2004h"); // Bracketed paste (unrelated control)
+    stream.nextSlice("hello");
+
+    try testing.expect(term.modes.get(.mouse_event_normal));
+    try testing.expect(term.modes.get(.mouse_format_sgr));
+
+    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    defer alloc.free(output);
+
+    // Mouse modes must NOT appear in the serialized output -- a freshly
+    // spawned shell can't consume mouse events, so leaking these turns
+    // every wheel tick into garbled SGR escapes at the prompt.
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b[?1000h") == null);
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b[?1006h") == null);
+    // Unrelated modes are preserved
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b[?2004h") != null);
+
+    // The live terminal still has mouse modes enabled (we only stripped
+    // them from the OUTPUT BYTES; if a TUI is still attached it needs them).
+    try testing.expect(term.modes.get(.mouse_event_normal));
+    try testing.expect(term.modes.get(.mouse_format_sgr));
 }
 
 test "serializeTerminalState excludes synchronized output replay" {
