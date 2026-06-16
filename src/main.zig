@@ -983,6 +983,22 @@ const Daemon = struct {
         return error.NoLeaderFound;
     }
 
+    /// True when the session's shell — not a child TUI — holds the PTY
+    /// foreground. forkpty makes the shell its own session/group leader, so
+    /// its pgid equals self.pid; a foregrounded child runs in a different
+    /// pgrp. Used to decide whether program-private input modes (mouse, focus)
+    /// captured in the vt model are stale (shell at prompt) and should be
+    /// stripped from a reattach replay, or still owned by a live program.
+    /// Defaults to true (strip) when the probe is unavailable — the safe side,
+    /// since a stale mode leaks visibly while a missing one is re-asserted by
+    /// the program on its next redraw.
+    fn shellIsForeground(self: *Daemon) bool {
+        if (self.pty_fd < 0) return true;
+        const fg = cross.c.tcgetpgrp(self.pty_fd);
+        if (fg < 0) return true;
+        return fg == self.pid;
+    }
+
     pub fn handleInit(
         self: *Daemon,
         client: *Client,
@@ -1003,8 +1019,12 @@ const Daemon = struct {
                 "cursor before serialize: x={d} y={d} pending_wrap={}",
                 .{ cursor.x, cursor.y, cursor.pending_wrap },
             );
-            if (util.serializeTerminalState(self.alloc, term)) |term_output| {
-                std.log.debug("serialize terminal state", .{});
+            // Strip program-private input modes only if the shell (not a live
+            // TUI) is foreground — otherwise the reattaching client would lose
+            // the mouse/focus reporting the running program still needs.
+            const strip_input_modes = self.shellIsForeground();
+            if (util.serializeTerminalState(self.alloc, term, strip_input_modes)) |term_output| {
+                std.log.debug("serialize terminal state strip_input_modes={}", .{strip_input_modes});
                 // Rewrite OSC 133;A to include redraw=0 so the outer terminal
                 // does not clear prompt lines on resize (issue #111).
                 const restore_data = util.rewritePromptRedraw(self.alloc, term_output) orelse term_output;
@@ -2707,7 +2727,9 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
     var snapshot_timer = try std.time.Timer.start();
     const snapshots_enabled = !daemon.is_task_mode;
     defer if (snapshots_enabled and !daemon.user_killed) {
-        if (util.serializeTerminalState(daemon.alloc, &term)) |vt_data| {
+        // Always strip input modes: `restore` spawns a fresh shell that never
+        // re-runs the TUI which owned the mode, so replaying it only leaks.
+        if (util.serializeTerminalState(daemon.alloc, &term, true)) |vt_data| {
             defer daemon.alloc.free(vt_data);
             persistence.writeSnapshot(
                 daemon.alloc,
@@ -2786,7 +2808,8 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
         // the serializer would lose the dirty signal until the next PTY byte.
         if (snapshots_enabled and daemon.snapshot_dirty and snapshot_timer.read() >= snapshot_interval_ns) {
             var write_ok = false;
-            if (util.serializeTerminalState(daemon.alloc, &term)) |vt_data| {
+            // Always strip input modes (see final-snapshot rationale above).
+            if (util.serializeTerminalState(daemon.alloc, &term, true)) |vt_data| {
                 defer daemon.alloc.free(vt_data);
                 persistence.writeSnapshot(
                     daemon.alloc,

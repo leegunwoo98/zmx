@@ -511,7 +511,42 @@ pub fn isUserInput(payload: []const u8) bool {
     return false;
 }
 
-pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
+// Input-routing modes that belong to the *program* that enabled them, not to
+// the terminal session. A TUI (vim, claude code, htop) turns these on for its
+// own input loop. If the program exits without resetting them (Ctrl-C, crash)
+// or we restore into a fresh shell, replaying them re-enables reporting with
+// nothing left to consume the events — so every wheel tick / focus change gets
+// typed at the prompt as raw escapes (mouse: `<65;58;22M`, focus: `[I`/`[O`).
+//
+// Excludes `mouse_alternate_scroll` (1007), a TERM_PROGRAM preference rather
+// than active tracking.
+const input_routing_modes = [_]ghostty_vt.modes.Mode{
+    .mouse_event_x10,
+    .mouse_event_normal,
+    .mouse_event_button,
+    .mouse_event_any,
+    .mouse_format_utf8,
+    .mouse_format_sgr,
+    .mouse_format_urxvt,
+    .mouse_format_sgr_pixels,
+    .focus_event,
+};
+
+/// Serialize the terminal's screen + modes for replay to a (re)attaching
+/// client or to a restore snapshot.
+///
+/// `strip_input_modes` controls whether program-private input-routing modes
+/// (mouse tracking, focus reporting) are excluded from the output:
+///   - snapshot/restore path: always true — the restored shell is fresh and
+///     never re-runs the TUI that owned the mode, so replaying it only leaks.
+///   - reattach path: true only when no program holds the PTY foreground
+///     (shell at prompt → any such mode is stale). When a live TUI is
+///     foreground it still needs the mode, so the caller passes false.
+pub fn serializeTerminalState(
+    alloc: std.mem.Allocator,
+    term: *ghostty_vt.Terminal,
+    strip_input_modes: bool,
+) ?[]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
 
@@ -525,30 +560,10 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         term.modes.set(.synchronized_output, false);
     }
 
-    // Mouse-tracking modes belong to the *program* that enabled them, not
-    // to the terminal state. If a TUI (vim, claude code, htop) enabled mouse
-    // reporting and didn't reset on exit (Ctrl-C, crash), serializing those
-    // modes here re-enables them in every reattaching client / restored
-    // daemon. The freshly spawned shell doesn't consume mouse events, so
-    // every wheel tick gets typed at the prompt as SGR sequences (e.g.
-    // `<65;58;22M`). Strip on serialize; programs re-enable on launch.
-    //
-    // Note: `mouse_alternate_scroll` (1007) is a TERM_PROGRAM preference,
-    // not active tracking, so leave it alone.
-    const stripped_mouse_modes = [_]ghostty_vt.modes.Mode{
-        .mouse_event_x10,
-        .mouse_event_normal,
-        .mouse_event_button,
-        .mouse_event_any,
-        .mouse_format_utf8,
-        .mouse_format_sgr,
-        .mouse_format_urxvt,
-        .mouse_format_sgr_pixels,
-    };
-    var saved_mouse: [stripped_mouse_modes.len]bool = undefined;
-    inline for (stripped_mouse_modes, 0..) |mode, i| {
-        saved_mouse[i] = term.modes.get(mode);
-        if (saved_mouse[i]) term.modes.set(mode, false);
+    var saved_input_modes: [input_routing_modes.len]bool = undefined;
+    inline for (input_routing_modes, 0..) |mode, i| {
+        saved_input_modes[i] = term.modes.get(mode);
+        if (strip_input_modes and saved_input_modes[i]) term.modes.set(mode, false);
     }
 
     const pages = &term.screens.active.pages;
@@ -639,10 +654,12 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
     if (had_synchronized_output) {
         term.modes.set(.synchronized_output, true);
     }
-    // Restore mouse modes (the live program still needs them; we only
-    // stripped them from the serialized output bytes).
-    inline for (stripped_mouse_modes, 0..) |mode, i| {
-        if (saved_mouse[i]) term.modes.set(mode, true);
+    // Restore any input-routing modes we cleared — the live `term` still
+    // owns them; we only stripped them from the serialized output bytes.
+    if (strip_input_modes) {
+        inline for (input_routing_modes, 0..) |mode, i| {
+            if (saved_input_modes[i]) term.modes.set(mode, true);
+        }
     }
 
     return alloc.dupe(u8, output) catch |err| {
@@ -1034,7 +1051,7 @@ test "isCtrlBackslash" {
     try expect(!isCtrlBackslash("\x1b[65;92u"));
 }
 
-test "serializeTerminalState strips mouse tracking modes but preserves them on the live term" {
+test "serializeTerminalState(strip=true) drops mouse+focus modes but preserves them on the live term" {
     const alloc = testing.allocator;
 
     var term = try ghostty_vt.Terminal.init(alloc, .{
@@ -1048,27 +1065,60 @@ test "serializeTerminalState strips mouse tracking modes but preserves them on t
 
     stream.nextSlice("\x1b[?1000h"); // X10 compat mouse (most common stuck mode)
     stream.nextSlice("\x1b[?1006h"); // SGR mouse encoding
+    stream.nextSlice("\x1b[?1004h"); // Focus reporting (same leak class, #10375)
     stream.nextSlice("\x1b[?2004h"); // Bracketed paste (unrelated control)
     stream.nextSlice("hello");
 
     try testing.expect(term.modes.get(.mouse_event_normal));
     try testing.expect(term.modes.get(.mouse_format_sgr));
+    try testing.expect(term.modes.get(.focus_event));
 
-    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    const output = serializeTerminalState(alloc, &term, true) orelse return error.TestUnexpectedNull;
     defer alloc.free(output);
 
-    // Mouse modes must NOT appear in the serialized output -- a freshly
-    // spawned shell can't consume mouse events, so leaking these turns
-    // every wheel tick into garbled SGR escapes at the prompt.
+    // Mouse + focus modes must NOT appear -- a freshly spawned shell can't
+    // consume the events, so leaking these turns every wheel tick / focus
+    // change into garbled escapes at the prompt.
     try testing.expect(std.mem.indexOf(u8, output, "\x1b[?1000h") == null);
     try testing.expect(std.mem.indexOf(u8, output, "\x1b[?1006h") == null);
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b[?1004h") == null);
     // Unrelated modes are preserved
     try testing.expect(std.mem.indexOf(u8, output, "\x1b[?2004h") != null);
 
-    // The live terminal still has mouse modes enabled (we only stripped
-    // them from the OUTPUT BYTES; if a TUI is still attached it needs them).
+    // The live terminal still has the modes enabled (we only stripped them
+    // from the OUTPUT BYTES).
     try testing.expect(term.modes.get(.mouse_event_normal));
     try testing.expect(term.modes.get(.mouse_format_sgr));
+    try testing.expect(term.modes.get(.focus_event));
+}
+
+test "serializeTerminalState(strip=false) preserves input modes for live-TUI reattach" {
+    const alloc = testing.allocator;
+
+    var term = try ghostty_vt.Terminal.init(alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+
+    // Simulates reattaching while a live TUI (e.g. vim with `set mouse=a`)
+    // holds the PTY foreground -- its mouse/focus modes must survive replay
+    // or the reattached client loses mouse support until the program restarts.
+    stream.nextSlice("\x1b[?1000h");
+    stream.nextSlice("\x1b[?1006h");
+    stream.nextSlice("\x1b[?1004h");
+    stream.nextSlice("editing");
+
+    const output = serializeTerminalState(alloc, &term, false) orelse return error.TestUnexpectedNull;
+    defer alloc.free(output);
+
+    // With stripping OFF, the modes the live program owns are replayed.
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b[?1000h") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b[?1006h") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\x1b[?1004h") != null);
 }
 
 test "serializeTerminalState excludes synchronized output replay" {
@@ -1090,7 +1140,7 @@ test "serializeTerminalState excludes synchronized output replay" {
     try testing.expect(term.modes.get(.bracketed_paste));
     try testing.expect(term.modes.get(.synchronized_output));
 
-    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    const output = serializeTerminalState(alloc, &term, true) orelse return error.TestUnexpectedNull;
     defer alloc.free(output);
 
     // The serialized output should contain bracketed paste (DECSET 2004)
@@ -1128,7 +1178,7 @@ fn expectCursorAt(term: *ghostty_vt.Terminal, row: usize, col: usize) !void {
 }
 
 fn serializeRoundtrip(alloc: std.mem.Allocator, source: *ghostty_vt.Terminal) !ghostty_vt.Terminal {
-    const serialized = serializeTerminalState(alloc, source) orelse
+    const serialized = serializeTerminalState(alloc, source, true) orelse
         return error.SerializationFailed;
     defer alloc.free(serialized);
 
@@ -1265,7 +1315,7 @@ test "serializeTerminalState nested roundtrip preserves content" {
     const inner_cursor_y = inner.screens.active.cursor.y;
 
     // Serialize inner (simulates inner daemon re-attach to inner client)
-    const inner_serialized = serializeTerminalState(alloc, &inner) orelse
+    const inner_serialized = serializeTerminalState(alloc, &inner, true) orelse
         return error.SerializationFailed;
     defer alloc.free(inner_serialized);
 
@@ -1358,7 +1408,7 @@ test "serializeTerminalState scrollback + size mismatch nested roundtrip" {
     const inner_cursor_y = inner.screens.active.cursor.y;
 
     // Inner serialize → outer processes → outer serialize → client
-    const inner_ser = serializeTerminalState(alloc, &inner) orelse
+    const inner_ser = serializeTerminalState(alloc, &inner, true) orelse
         return error.SerializationFailed;
     defer alloc.free(inner_ser);
 
